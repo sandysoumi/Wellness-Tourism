@@ -1,0 +1,9 @@
+# Training pipeline dependencies (GitHub Actions + notebook).
+# Versions are pinned so the model trained in CI loads identically in the app.
+pandas==2.2.3
+numpy==2.2.4
+scikit-learn==1.6.1
+xgboost==2.1.4
+joblib==1.4.2
+mlflow==2.21.0
+sqlalchemy==2.0.40   # mlflow 2.21's SQLite backend breaks with SQLAlchemy 2.1
