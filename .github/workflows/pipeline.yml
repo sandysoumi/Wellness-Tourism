@@ -1,0 +1,173 @@
+# End-to-end MLOps pipeline for the Wellness Tourism Package model.
+#
+#   data_registration -> data_preparation -> model_building -> deploy_model -> output_report
+#
+# Train/test splits pass between jobs as the "data-splits" artifact. The
+# champion model is committed back to main, and Streamlit Community Cloud
+# redeploys the app automatically whenever main changes.
+name: MLOps Pipeline - Wellness Tourism
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "tourism_project/deployment/model.joblib"   # commits made by this workflow
+      - "tourism_project/deployment/metrics.json"
+      - "**.md"
+      - "**.ipynb"
+  workflow_dispatch:                                # manual runs from the Actions tab
+    inputs:
+      exclude_post_contact:
+        description: "Train without post-pitch features (score leads before contact)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write                                   # lets the workflow push to main
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────── 1
+  data_registration:
+    name: 1. Data registration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: tourism_project/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r tourism_project/requirements.txt
+
+      - name: Validate schema and register dataset
+        run: python tourism_project/model_building/data_register.py
+
+  # ─────────────────────────────────────────────────────────────── 2
+  data_preparation:
+    name: 2. Data preparation
+    needs: data_registration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: tourism_project/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r tourism_project/requirements.txt
+
+      - name: Clean data and create train/test split
+        run: python tourism_project/model_building/prep.py
+
+      - name: Upload train/test splits as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-splits
+          path: tourism_project/data/processed/
+          retention-days: 7
+
+  # ─────────────────────────────────────────────────────────────── 3
+  model_building:
+    name: 3. Model building & MLflow tracking
+    needs: data_preparation
+    runs-on: ubuntu-latest
+    env:
+      EXCLUDE_POST_CONTACT: ${{ inputs.exclude_post_contact || 'false' }}
+      MIN_TEST_F1: "0.60"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: tourism_project/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r tourism_project/requirements.txt
+
+      - name: Download train/test splits artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: data-splits
+          path: tourism_project/data/processed/
+
+      - name: Tune 6 models, log to MLflow, evaluate, quality gate
+        run: python tourism_project/model_building/train.py
+
+      - name: Upload champion model as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: best-model
+          path: |
+            tourism_project/deployment/model.joblib
+            tourism_project/deployment/metrics.json
+
+      - name: Upload MLflow tracking database
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-tracking
+          path: mlflow.db
+
+  # ─────────────────────────────────────────────────────────────── 4
+  deploy_model:
+    name: 4. Commit model to main
+    needs: model_building
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Download champion model artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: best-model
+          path: tourism_project/deployment/
+
+      - name: Commit and push model to main
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(ci): update trained model (run ${{ github.run_number }}) [skip ci]"
+          file_pattern: "tourism_project/deployment/model.joblib tourism_project/deployment/metrics.json"
+          branch: main
+
+  # ─────────────────────────────────────────────────────────────── 5
+  output_report:
+    name: 5. Output report
+    needs: deploy_model
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Repository folder structure
+        run: find . -path ./.git -prune -o -print | sort
+
+      - name: Write run summary
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          m = json.load(open("tourism_project/deployment/metrics.json"))
+          print(f"## Champion: {m['best_model']} (threshold {m['threshold']})")
+          print(f"Trained {m['trained_at_utc']} UTC · cross-validated F1 {m['cv_f1']}\n")
+          print("| Model | CV F1 | Test F1 | Precision | Recall | ROC-AUC |")
+          print("|---|---|---|---|---|---|")
+          for r in m["all_results"]:
+              print(f"| {r['model']} | {r['oof_f1']:.3f} | {r['f1']:.3f} | "
+                    f"{r['precision']:.3f} | {r['recall']:.3f} | {r['roc_auc']:.3f} |")
+          PY
+          cat "$GITHUB_STEP_SUMMARY"
